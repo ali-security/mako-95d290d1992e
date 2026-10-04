@@ -1,20 +1,18 @@
 name: Run tests
 
 on:
-  # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector passed to tox; empty runs the full suite"
+        required: false
+        default: ""
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       # run this job using this matrix
       matrix:
@@ -33,19 +31,27 @@ jobs:
           # See https://github.com/bbangert/beaker/pull/213
           - os: "windows-latest"
             python-version: "3.10"
+          # CPython 3.7 cannot be provisioned on arm64 macOS (needs openssl@1.1); run it on the x64 macOS runner instead
+          - os: "macos-latest"
+            python-version: "3.7"
+        include:
+          - os: "macos-15-intel"
+            python-version: "3.7"
 
       fail-fast: false
 
     # steps to run in each job. Some are github actions, others run shell commands
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        uses: MatteoH2O1999/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
+          cache-build: true
+          allow-build: allow
 
       - name: Install dependencies
         run: |
@@ -54,4 +60,48 @@ jobs:
           pip list
 
       - name: Run tests
-        run: tox
+        shell: bash
+        env:
+          PIP_CONSTRAINT: ${{ runner.temp }}/test-constraints.txt
+        run: |
+          # Pygments 2.20+ changed HTML escaping of highlighted source, breaking
+          # test_exceptions' expected-markup assertions written against release-era Pygments
+          echo 'pygments<2.20' > "$RUNNER_TEMP/test-constraints.txt"
+          tox -- ${{ inputs.test-filter }}
+
+  build-dist:
+    name: build-sdist-wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build sdist and wheel
+        env:
+          # release-era build tooling inside build isolation
+          PIP_INDEX_URL: "https://:2022-11-15T14:37:53.675556Z@time-machines-pypi.sealsecurity.io/"
+        run: |
+          # the released sdist's metadata (PKG-INFO "Platform: UNKNOWN", entry_points.txt
+          # trailing blank line) comes from setuptools <= 59; the released wheel's
+          # METADATA from a newer setuptools with bdist_wheel 0.38.4
+          printf 'setuptools==59.8.0\nwheel==0.38.4\n' > "$RUNNER_TEMP/sdist-constraints.txt"
+          printf 'wheel==0.38.4\n' > "$RUNNER_TEMP/wheel-constraints.txt"
+          # release builds drop setup.cfg's dev tag (egg_info -b "")
+          sed -i 's/^tag_build = dev$/tag_build =/' setup.cfg
+          python -m pip install build
+          PIP_CONSTRAINT="$RUNNER_TEMP/sdist-constraints.txt" python -m build --sdist
+          PIP_CONSTRAINT="$RUNNER_TEMP/wheel-constraints.txt" python -m build --wheel
+          ls -l dist
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
